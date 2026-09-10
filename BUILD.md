@@ -39,3 +39,20 @@ sudo chown -R 0:0 RegionSpoof.kext
 > 说明:`-fapple-kext -mkernel` 走 kext 专用 ABI;`-lkmod -lkmodc++ -lcc_kext` + `-Xlinker -kext`
 > 是 kext 必需的链接库。`codesign -s -` 是 ad-hoc 签名(因此**必须 Permissive / 完整关 SIP** 才能加载;
 > 想在 SIP-on 下用,把 `-s -` 换成你的 Developer-ID,并走 Reduced Security)。
+
+# 编译 perapp-zh 的系统设置代理（可选）
+
+仓库自带预编译的 `perapp-zh/SettingsZH.app` 与 `perapp-zh/lshandler`（arm64，ad-hoc 签名）。
+只有想自行审计 / 修改时才需要重编（同样需要 Command Line Tools）：
+
+```bash
+cd perapp-zh
+mkdir -p SettingsZH.app/Contents/MacOS
+swiftc -O -target arm64-apple-macos14.0 -o SettingsZH.app/Contents/MacOS/SettingsZH settings-zh-agent.swift
+cp SettingsZH-Info.plist SettingsZH.app/Contents/Info.plist
+codesign -f -s - SettingsZH.app
+swiftc -O -target arm64-apple-macos14.0 -o lshandler lshandler.swift
+```
+
+> `-target` 不能省：beta 工具链默认把二进制的最低系统版本设成 SDK 版本，可能比当前系统还新，
+> LaunchServices 会以 `-10825` 拒绝启动。`perapp-zh.sh settings` 在缺预编译文件时也会用同样的命令自动编译。

@@ -6,6 +6,8 @@
 # 用法:
 #   sudo ./install.sh             安装(默认)
 #   sudo ./install.sh status      查看状态 / 体检
+#   sudo ./install.sh diagnose    一键诊断（报 issue 贴这个）
+#   sudo ./install.sh pcc         只读诊断 PCC 云端链路
 #   sudo ./install.sh uninstall   卸载
 #
 set -uo pipefail
@@ -46,13 +48,24 @@ LOADER_SRC="$DIR/region-kext-load.sh";         LOADER_DST="/usr/local/bin/region
 PLIST_SRC="$DIR/com.local.regionkext.plist";   PLIST_DST="/Library/LaunchDaemons/com.local.regionkext.plist"
 KEXT_ID="com.local.RegionSpoof";  DAEMON="system/com.local.regionkext"
 ELIG="/private/var/db/eligibilityd/eligibility.plist"
+PCC_DIAG="$DIR/pcc-diagnose.sh"
 
 # ───────── 状态探测 ─────────
 region_is_LL(){ ioreg -ard1 -c IOPlatformExpertDevice 2>/dev/null | plutil -p - 2>/dev/null | grep -q 4c4c2f41; }
 kext_loaded(){  kmutil showloaded --no-kernel-components 2>/dev/null | grep -qi regionspoof; }
 greymatter(){   /usr/libexec/PlistBuddy -c "Print :OS_ELIGIBILITY_DOMAIN_GREYMATTER:os_eligibility_answer_t" "$ELIG" 2>/dev/null; }
-sip_off(){      csrutil status 2>/dev/null | grep -qi disabled; }
-amfi_off(){     nvram boot-args 2>/dev/null | grep -q amfi_get_out_of_my_way; }
+sip_fully_off(){ csrutil status 2>/dev/null | grep -qi 'System Integrity Protection status: disabled'; }
+sip_allows_kext(){
+  local status
+  status="$(csrutil status 2>/dev/null)"
+  printf '%s\n' "$status" | grep -qi 'System Integrity Protection status: disabled' \
+    || printf '%s\n' "$status" | grep -Eqi 'Kext Signing:[[:space:]]*disabled'
+}
+amfi_bypass_bootarg(){
+  nvram boot-args 2>/dev/null \
+    | grep -Eq '(^|[[:space:]])amfi_get_out_of_my_way(=[0-9]+)?([[:space:]]|$)'
+}
+amfi_launch_constraints(){ sysctl -n security.mac.amfi.launch_constraints_enforced 2>/dev/null || echo '?'; }
 
 # ───────── AI 守护进程刷新 ─────────
 refresh_ai(){
@@ -60,6 +73,15 @@ refresh_ai(){
   for d in eligibilityd modelcatalogd modelmanagerd; do
     launchctl kickstart -k "system/com.apple.$d" >/dev/null 2>&1 || true
   done
+}
+
+# ───────── 去 quarantine(zip 下载的文件带此属性时,开机 LaunchDaemon 会被拒绝执行 → 重启后失效)─────────
+strip_quarantine(){
+  local f
+  for f in "$KEXT_DST" "$LOADER_DST" "$PLIST_DST"; do [ -e "$f" ] && xattr -dr com.apple.quarantine "$f" 2>/dev/null; done
+  if xattr -lr "$KEXT_DST" "$LOADER_DST" "$PLIST_DST" 2>/dev/null | grep -q com.apple.quarantine; then
+    warn "quarantine 属性未能清除,重启后 LaunchDaemon 可能被拒绝执行"
+  else ok "已清除 quarantine 属性(避免重启后 LaunchDaemon 被拒)"; fi
 }
 
 # ───────── 装/启 LaunchDaemon(开机自动加载)─────────
@@ -80,33 +102,43 @@ preflight(){
   [ -d "$KEXT_SRC" ] || die "找不到 $KEXT_SRC —— 请在项目目录里运行本脚本。"
   ok "项目文件就位"
 
-  if ! sip_off; then
-    err "SIP 仍开启 —— ad-hoc kext 无法加载。请先关 SIP:"
+  if ! sip_allows_kext; then
+    err "当前 SIP 配置仍强制 kext 签名 —— ad-hoc kext 无法加载。请在恢复模式只关闭 kext 签名检查:"
     hr
     cat <<'EOS'
   1. 苹果菜单 → 关机
   2. 长按电源键,直到出现「正在载入启动选项 / Loading startup options」
   3. 选项(Options)→ 继续 → 选账户 → 输密码
   4. 顶部菜单栏 → 实用工具 → 终端(Terminal)
-  5. 输入:  csrutil disable        (按提示 y / 验证身份)
+  5. 输入:  csrutil enable --without kext
+     (如果该系统拒绝这条命令，再用 csrutil disable；前者安全面更小)
   6. 输入:  reboot
 然后重新运行本脚本。
 EOS
     exit 1
   fi
-  ok "SIP 已关闭(Permissive)"
+  if sip_fully_off; then
+    warn "SIP 已完整关闭；kext 可以运行，但项目实际只需要 kext 签名豁免。"
+    echo "  稳定后可在恢复模式改用: csrutil enable --without kext"
+  else
+    ok "SIP 已保留，仅关闭 kext 签名检查"
+  fi
 
-  # AMFI —— PCC 云端 AI 的命根子;关掉它 PCC 必死
-  if amfi_off; then
-    warn "boot-args 含 amfi_get_out_of_my_way —— 它会让 SEP 拒绝 PCC 证明,正在移除…"
+  # 这里只能可靠识别显式的 AMFI 绕过 boot-arg，不能据此承诺 PCC 一定可用。
+  if amfi_bypass_bootarg; then
+    warn "boot-args 含 amfi_get_out_of_my_way —— 它会破坏 PCC 所需的安全前提,正在移除…"
     local args new
     args="$(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')"
-    new="$(printf '%s' "$args" | sed -E 's/amfi_get_out_of_my_way=[0-9]*//g' | xargs || true)"
+    new="$(printf '%s' "$args" \
+      | sed -E 's/(^|[[:space:]])amfi_get_out_of_my_way(=[0-9]+)?([[:space:]]|$)/ /g' \
+      | xargs || true)"
     if [ -z "$new" ]; then nvram -d boot-args 2>/dev/null || true; else nvram boot-args="$new" 2>/dev/null || true; fi
-    AMFI_CHANGED=1
-    ok "已移除(重启后 AMFI 恢复,PCC 才可用)"
+    if amfi_bypass_bootarg; then
+      die "无法移除 AMFI 绕过参数；请在恢复模式手动清理 boot-args。"
+    fi
+    AMFI_CHANGED=1; ok "已移除显式 AMFI 绕过参数（重启后生效）"
   else
-    ok "AMFI 已启用(PCC 云端可用)"
+    ok "未发现 amfi_get_out_of_my_way 绕过参数"
   fi
 }
 
@@ -117,6 +149,7 @@ do_install(){
   rm -rf "$KEXT_DST"; cp -R "$KEXT_SRC" "$KEXT_DST"; chown -R 0:0 "$KEXT_DST"
   ok "kext → $KEXT_DST  (root:wheel)"
   install_daemon
+  strip_quarantine
 
   hr; info "加载 kext"
   if kext_loaded && region_is_LL; then
@@ -145,8 +178,8 @@ EOS
   if region_is_LL && [ "$(greymatter)" = "4" ]; then
     ok "${W}Apple 智能已开启!${N}"
     echo "  • 端侧(校对/摘要/Genmoji/写作工具基础项):即刻可用"
-    echo "  • PCC 云端(语气改写/图乐园):首次需等模型下完 + 证明池预热几分钟"
-    [ "$AMFI_CHANGED" = "1" ] && warn "你刚移除了 amfi boot-arg,请【重启一次】让 PCC 生效。"
+    echo "  • PCC 云端是独立链路；请用 'sudo ./install.sh pcc' 验证，资格通过不等于云端必定成功"
+    [ "$AMFI_CHANGED" = "1" ] && warn "你刚移除了 AMFI 绕过参数，请【重启一次】再测 PCC。"
   else
     warn "尚未完全就绪 —— 多半还需批准 kext 并重启,或模型仍在下载;稍后用 'sudo ./install.sh status' 复查。"
   fi
@@ -170,8 +203,15 @@ do_uninstall(){
 do_status(){
   [ "${1:-}" = "quiet" ] || banner
   hr; info "RegionSpoof 状态"
-  printf '  %-14s %s\n' "SIP:"          "$(sip_off && echo "${G}已关(Permissive)${N}" || echo "${R}开启(kext 无法加载)${N}")"
-  printf '  %-14s %s\n' "AMFI:"         "$(amfi_off && echo "${R}关闭(PCC 会失效!)${N}" || echo "${G}启用${N}")"
+  if sip_fully_off; then
+    printf '  %-14s %s\n' "SIP:" "${Y}完整关闭（可用，但豁免过宽）${N}"
+  elif sip_allows_kext; then
+    printf '  %-14s %s\n' "SIP:" "${G}自定义：允许第三方 kext${N}"
+  else
+    printf '  %-14s %s\n' "SIP:" "${R}kext 签名检查开启（无法加载）${N}"
+  fi
+  printf '  %-14s %s\n' "AMFI 绕过:"   "$(amfi_bypass_bootarg && echo "${R}boot-arg 存在${N}" || echo "${G}未发现${N}")"
+  printf '  %-14s %s\n' "启动约束:"     "$(amfi_launch_constraints)（只作状态展示，不单独判定 PCC）"
   printf '  %-14s %s\n' "region=LL/A:"  "$(region_is_LL && echo "${G}是${N}" || echo "${R}否(仍是 CH)${N}")"
   printf '  %-14s %s\n' "kext 已加载:"   "$(kext_loaded && echo "${G}是${N}" || echo "${R}否${N}")"
   local gm; gm="$(greymatter)"
@@ -182,7 +222,7 @@ do_status(){
 
 # ───────── 诊断报告(报 issue 用;纯文本,无颜色,方便整段复制)─────────
 do_diagnose(){
-  local osv osb model csr ba region gm kb hum
+  local osv osb model csr ba region gm
   echo "════════════════ RegionSpoof 诊断报告 ════════════════"
   echo "（把从上面这行 ═ 到最底下 ═ 的整段，原样贴进 GitHub issue）"
   echo
@@ -195,12 +235,23 @@ do_diagnose(){
   echo
 
   echo "## 安全状态"
-  echo "  SIP   : $(sip_off && echo '已关 disabled（正确）' || echo '⚠️ 未完全关闭——ad-hoc kext 加载不了')"
+  if sip_fully_off; then
+    echo "  SIP   : 完整关闭（kext 可用；项目不需要关闭全部保护）"
+  elif sip_allows_kext; then
+    echo "  SIP   : 自定义，仅 kext 签名豁免（推荐）"
+  else
+    echo "  SIP   : ⚠️ kext 签名检查仍开启，ad-hoc kext 加载不了"
+  fi
   csr="$(csrutil status 2>/dev/null)"; printf '%s\n' "$csr" | sed 's/^/        /'
-  if amfi_off; then echo "  AMFI  : ⚠️ 关闭——PCC 云端必失效！boot-args 里有 amfi_get_out_of_my_way，删掉它"
-  else echo "  AMFI  : 启用（正确，PCC 可用）"; fi
+  if amfi_bypass_bootarg; then echo "  AMFI boot-arg: ⚠️ 有 amfi_get_out_of_my_way，必须移除后重启"
+  else echo "  AMFI boot-arg: 未发现显式绕过（这不等于 PCC 已通过）"; fi
+  echo "  AMFI launch constraints: $(amfi_launch_constraints)"
   ba="$(nvram boot-args 2>/dev/null | sed 's/^boot-args[[:space:]]*//')"; [ -z "$ba" ] && ba='(空)'
   echo "  boot-args: $ba"
+  echo "  本地安全策略摘要:"
+  bputil -d 2>/dev/null \
+    | grep -E 'Security Mode|3rd Party Kexts|System Integrity Protection' \
+    | head -8 | sed 's/^/    /' || true
   echo
 
   echo "## 区域 & kext"
@@ -213,28 +264,36 @@ do_diagnose(){
   echo "## 资格 GREYMATTER（4=已开启，2=未开启）"
   gm="$(greymatter)"
   echo "  answer = ${gm:-未读到}  $([ "$gm" = "4" ] && echo '✅ 已开启' || echo '❌ 没到 4，AI 没真正打开')"
-  echo "  逐项输入状态（值为 2 的那一项 = 没过、就是它卡住的）:"
+  echo "  逐项输入状态（用于定位；个别输入为 2 不代表域必然失败，以上面的 domain answer 为准）:"
   /usr/libexec/PlistBuddy -c "Print :OS_ELIGIBILITY_DOMAIN_GREYMATTER:status" "$ELIG" 2>/dev/null \
     | sed 's/^/    /' || echo "    (读不到——eligibilityd 还没算出来，或路径有变)"
   echo
 
-  echo "## 模型资产（端侧+云端都得先下完这些）"
-  kb="$( { find /System/Library/AssetsV2 -maxdepth 1 -type d \
-           \( -iname '*Generative*' -o -iname '*UAF_FM*' -o -iname '*Visual*' -o -iname '*CodeLM*' -o -iname '*ModelCatalog*' \) \
-           -print0 2>/dev/null | xargs -0 du -sk 2>/dev/null; } | awk '{s+=$1} END{print s+0}')"
-  if [ "${kb:-0}" -gt 0 ] 2>/dev/null; then
-    hum="$(awk -v k="$kb" 'BEGIN{printf "%.1f", k/1024/1024}')"
-    echo "  AI 模型总大小: ~${hum}G  （下全约 30G+；明显偏小 = 还在下载，等它下完）"
+  echo "## 语言 & 逐 App 汉化（perapp-zh）"
+  local cu cuid cuh pz
+  cu="${SUDO_USER:-$(stat -f %Su /dev/console 2>/dev/null)}"; cuid="$(id -u "$cu" 2>/dev/null)"
+  cuh="$(dscl . -read "/Users/$cu" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  if [ -n "$cu" ] && [ -n "$cuh" ]; then
+    echo "  用户 $cu 全局 AppleLanguages: $(sudo -u "$cu" defaults read -g AppleLanguages 2>/dev/null | tr -d '\n ' || echo '?')"
+    echo "  Siri 语言: $(sudo -u "$cu" defaults read com.apple.assistant.backedup 'Session Language' 2>/dev/null || echo '未设置')"
+    echo "    (两者首项须一致且为 AI 支持语言；新 Siri 目前只认英文——系统语言设中文会掉新 Siri，中文界面请走 perapp-zh)"
+    pz="$cuh/Library/Application Support/perapp-zh"
+    if [ -f "$pz/manifest.txt" ]; then
+      echo "  perapp-zh: 已汉化 $(grep -c '' "$pz/manifest.txt" 2>/dev/null) 项；系统设置代理 $(launchctl print "gui/$cuid/local.settings-zh-agent" 2>/dev/null | grep -q 'state = running' && echo '运行中' || echo '未运行')；深链接处理器 $([ -x "$pz/lshandler" ] && sudo -u "$cu" "$pz/lshandler" get x-apple.systempreferences 2>/dev/null || echo '?')"
+    else
+      echo "  perapp-zh: 未使用（想要中文界面见 perapp-zh/README.md）"
+    fi
   else
-    echo "  AI 模型总大小: 0 / 未找到 —— 还没下完，或被文件系统保护挡住（部分关 SIP 时会这样）"
+    echo "  (读不到控制台用户，跳过)"
   fi
   echo
 
-  echo "## PCC 云端日志（近 3 分钟；只关系语气改写/图乐园/Reframe，端侧功能跟它无关）"
-  { log show --last 3m --predicate 'process == "privatecloudcomputed"' 2>/dev/null \
-      | grep -iE 'finished successfully|3200[0-9]|RetryAfter|NWError|3205[0-9]|Insufficient inline|32080' \
-      | tail -8 | sed 's/^/  /'; } || true
-  echo "  （出现 'Ropes request finished successfully' = 云端正常；32001+RetryAfter = 被限流，停手等几小时）"
+  echo "## PCC 云端分类（只读，不输出请求内容）"
+  if [ -x "$PCC_DIAG" ]; then
+    "$PCC_DIAG" --since 30m | sed 's/^/  /'
+  else
+    echo "  缺少或不可执行: $PCC_DIAG"
+  fi
   echo
   echo "════════════════ 诊断报告结束 ════════════════"
 }
@@ -245,5 +304,6 @@ case "${1:-install}" in
   uninstall|remove) do_uninstall ;;
   status|verify|doctor) do_status ;;
   diagnose|report|log) do_diagnose ;;
-  *) echo "用法: sudo $0 [install|status|diagnose|uninstall]"; exit 1 ;;
+  pcc|cloud) shift; exec "$PCC_DIAG" "$@" ;;
+  *) echo "用法: sudo $0 [install|status|diagnose|pcc|uninstall]"; exit 1 ;;
 esac

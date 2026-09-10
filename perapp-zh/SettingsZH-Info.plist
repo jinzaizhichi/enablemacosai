@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>local.settings-zh-agent</string>
+  <key>CFBundleName</key><string>SettingsZH</string>
+  <key>CFBundleExecutable</key><string>SettingsZH</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>0.3</string>
+  <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>CFBundleURLTypes</key><array><dict>
+    <key>CFBundleURLName</key><string>System Settings deep link (forwarded in Chinese)</string>
+    <key>CFBundleURLSchemes</key><array><string>x-apple.systempreferences</string></array>
+    <key>LSHandlerRank</key><string>Owner</string>
+  </dict></array>
+</dict></plist>
